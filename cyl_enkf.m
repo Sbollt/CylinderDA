@@ -208,7 +208,7 @@ Z_sparse = Z(cyl_nodes_global,:);
 Ud_sparse = Ud(cyl_nodes_global);
 
 % solve RB problem, and apply ENKF
-n_ens = 5;
+n_ens = 30;
 aalpha_rb = zeros(N,nt, n_ens);
 aalpha_rb(:,1,:) = repmat(Z'*ops.X*UUpod(:,1),[1,n_ens]); % project FE sol onto RB space
 
@@ -216,8 +216,8 @@ aalpha_rb(:,1,:) = repmat(Z'*ops.X*UUpod(:,1),[1,n_ens]); % project FE sol onto 
 a0 = aalpha_rb(:,1);
 Chat = zeros(N, N, nt);
 mhat = zeros(N,nt);
-Gamma = 0.1 * eye(length(cyl_nodes_global));      % covariance for observations
-IC_perturb = 2;
+Gamma = 0.001;      % covariance for observations
+IC_perturb = 0.01;
 
 tic
 %TODO Encapsulate
@@ -252,7 +252,7 @@ for i = 1:nt
         % get pressure data (observed)
         %TODO Add perturbations
         pressure_observed_i(:,j) = UU(cyl_nodes_global,i)...
-            + (randn(1,length(cyl_nodes_global))*Gamma)';
+            + (randn(length(cyl_nodes_global),1).*UU(cyl_nodes_global,i)*Gamma);
         
         
         % save RB solution (prediction)
