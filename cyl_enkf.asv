@@ -216,7 +216,7 @@ aalpha_rb(:,1,:) = repmat(Z'*ops.X*UUpod(:,1),[1,n_ens]); % project FE sol onto 
 a0 = aalpha_rb(:,1);
 Chat = zeros(N, N, nt);
 mhat = zeros(N,nt);
-Gamma = 0.1 * eye(length(cyl_nodes_global));      % covariance for observations
+Gamma = 0.001 * eye(length(cyl_nodes_global));      % covariance for observations
 IC_perturb = 2;
 
 tic
