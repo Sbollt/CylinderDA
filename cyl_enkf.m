@@ -2,7 +2,7 @@
 clear; close all
 
 % Getting the appropriate directories
-addpath(genpath('../../'));
+%addpath(genpath('../../'));
 
 %% Create mesh using distmesh2d (open source)
 
@@ -113,17 +113,6 @@ end
 iStart = 50;
 UU = UU0(:,iStart:end); tt = tt0(iStart:end); nt = length(tt);
 
-% compute kinetic energy and drag
-pqt = timeopt.order;
-opt_out.terminalBool = false; opt_out_T.terminalBool = true;
-outfun_fe = @(U,t) compute_output_vec(eqn,meshes,refs,ops,U,opt_out,t);
-outfun_T_fe = @(U,t) compute_output_vec(eqn,meshes,refs,ops,U,opt_out_T,t);
-
-eqn.out_ke = true;
-ke_fe = compute_output_unsteady(pqt,outfun_fe,outfun_T_fe,tt,UU);
-eqn.out_ke = false;
-drag_fe = compute_output_unsteady(pqt,outfun_fe,outfun_T_fe,tt,UU);
-
 %% Get reduced-order model
 
 % Get solution snapshots for POD
@@ -135,29 +124,10 @@ UU0pod = UU0-Ud; UUpod = UU-Ud;
 Nmax = nt0; podtol = 1e-8;
 Zmax = pod(ops.X,reshape(UU0pod,[ops.ndof,nt0]),Nmax,podtol);
 
-% set options for reduced basis (POD) solver
-rb_opt = struct('lifting','particular','mu0',mu0);
-
 % choose N (number of basis functions)
-% use error in Kinetic Energy to decide
-errN = Inf; N = 0;
-while errN > 1e-2
-    N = N + 1;
-    Z = Zmax(:,1:N);
-    rb_ops = construct_rb(eqn,meshes,refs,Z,rb_opt);
-    
-    % get equations for RB problems in primal space
-    outfun_rb = @(U,t) compute_eqp_output(eqn,rb_ops,U,opt_out,t);
-    outfun_T_rb = @(U,t) compute_eqp_output(eqn,rb_ops,U,opt_out_T,t);
-    
-    % compute output
-    aalpha_rb_p = Z'*ops.X*UUpod;
-    eqn.out_ke = true;
-    ke_rb_p = compute_output_unsteady(pqt,outfun_rb,outfun_T_rb,tt,aalpha_rb_p);
-    
-    % compute error
-    errN = abs(ke_rb_p-ke_fe)/abs(ke_fe);
-end
+N = 4; Z = Zmax(:,1:N);
+rb_opt = struct('lifting','particular','mu0',mu0);
+rb_ops = construct_rb(eqn,meshes,refs,Z,rb_opt);
 
 %% get coordinates for pressure sensors
 % choose pressure sensors on surface of cylinder
@@ -199,7 +169,7 @@ legend("All nodes","Cylinder nodes","Sparse cylinder nodes");
 %% apply Ensemble Kalman filter to reduced-order model
 % needs to be implemented
 
-% get equations for RB problems in primal space
+% get equations for RB problem
 resfun_rb = @(U,t) compute_eqp_residual(eqn,rb_ops,U,t);
 massfun_rb = @(U,t) compute_eqp_mass(eqn,rb_ops,U,t);
 
@@ -207,107 +177,112 @@ massfun_rb = @(U,t) compute_eqp_mass(eqn,rb_ops,U,t);
 Z_sparse = Z(cyl_nodes_global,:);
 Ud_sparse = Ud(cyl_nodes_global);
 
-% solve RB problem, and apply ENKF
-n_ens = 30;
-aalpha_rb = zeros(N,nt, n_ens);
-aalpha_rb(:,1,:) = repmat(Z'*ops.X*UUpod(:,1),[1,n_ens]); % project FE sol onto RB space
+% solve RB problem (using time-marching)
+a0 = Z'*ops.X*UUpod(:,1); % get initial RB coefficients using projection
+timeopt_rb = timeopt; % copy time-marching structure
+timeopt_rb.timedomain = [0,(nt-1)*timeopt_rb.h]; % update time domain
+eqn.mu(1) = mmu{1}(1);
+[~,aalpha_rb,~] = bdf(resfun_rb,massfun_rb,a0,timeopt_rb,newtonopt);
+
+% solve RB problem, but apply ENKF
+n_ens = 5;
+aalpha_enkf = zeros(N,nt,n_ens);
+aalpha_enkf(:,1,:) = repmat(aalpha_rb(:,1),[1,1,n_ens]);
 
 %TODO Intialize N realizations with noise
-a0 = aalpha_rb(:,1);
 Chat = zeros(N, N, nt);
 mhat = zeros(N,nt);
 Gamma = 0.001;      % covariance for observations
 IC_perturb = 0.01;
 
-tic
+%Add noise to initial conditions
+a0 = aalpha_rb(:,1);
+for jdx = 1:n_ens
+    aalpha_enkf(:,1,jdx) = a0.*(ones(N,1)+randn(N,1)*IC_perturb);
+end
+
 %TODO Encapsulate
 for i = 1:nt
+    % initialize matrices to hold pressure values
     pressure_observed_i = zeros(length(cyl_nodes_global),n_ens);
     pressure_predicted_i = zeros(length(cyl_nodes_global),n_ens);
+    
+    % prediction step
     for j = 1:n_ens
         % get solutions for time-marching
         if (i <= timeopt.order)
-            a0 = aalpha_rb(:,1,j);
+            a0 = aalpha_enkf(:,1,j);
         else
-            a0 = aalpha_rb(:,i-1:-1:i-timeopt.order,j);
-        end
-  
-        %Add noise for first loop
-        if i == 1
-            a0 = a0 + randn(size(a0)).*a0*IC_perturb;
+            a0 = aalpha_enkf(:,i-1:-1:i-timeopt.order,j);
         end
         
-        % apply time-marching
-        %\hat{v}_{j+1}
+        % apply time-marching (update \hat{v}_{j+1})
         [~,ai,~] = bdf(resfun_rb,massfun_rb,a0,timeopt,newtonopt);
         
         % get pressure data (predicted by RB model)
-        H = [Z_sparse];
+        H = Z_sparse;
         pressure_predicted_i(:,j) = H*ai(:,end)+Ud_sparse;
-%         pressure_predicted = Z_sparse*ai(:,end)+Ud_sparse;
+        %         pressure_predicted = Z_sparse*ai(:,end)+Ud_sparse;
         ai_enkf = ai(:,end);
-  
-  
+        
         % Perturbed pressure
         % get pressure data (observed)
         %TODO Add perturbations
         pressure_observed_i(:,j) = UU(cyl_nodes_global,i)...
             + (randn(length(cyl_nodes_global),1).*UU(cyl_nodes_global,i)*Gamma);
         
-        
         % save RB solution (prediction)
         % These are \hat{v}_j+1 (for now)
-        aalpha_rb(:, i, j) = ai_enkf;
+        aalpha_enkf(:, i, j) = ai_enkf;
     end
     % update solution using ENKF
     %Population mean
-    mhat(:,i) = (1/n_ens)* sum(aalpha_rb(:,i,:),3);
+    mhat(:,i) = (1/n_ens)* sum(aalpha_enkf(:,i,:),3);
     %Calcuate population covariance
     for j = 1:n_ens
-      Chat(:,:,i) = Chat(:,:,i) + (aalpha_rb(:,i,j) - mhat(:,i))*(aalpha_rb(:,i,j) - mhat(:,i))';
+        Chat(:,:,i) = Chat(:,:,i) + (aalpha_enkf(:,i,j) - mhat(:,i))*(aalpha_enkf(:,i,j) - mhat(:,i))';
     end
     Chat(:,:,i) = (1/(n_ens - 1))*Chat(:,:,i);
-
+    
+    % analysis step
     % Calculate Kalman matricies for update
     S = H*Chat(:,:,i)*H.';
     K = Chat(:,:,i)*H.'*pinv(S);
-
+    
     %Update time steps (\hat{v}_{j+1} \mapsto v_{j+1}
     for j = 1:n_ens
-      aalpha_rb(:,i,j) = eye(size(K,1))*ai_enkf - K*(H*ai_enkf+Ud_sparse) + K*pressure_observed_i(:,j);
+        aalpha_enkf(:,i,j) = eye(size(K,1))*ai_enkf - K*(H*ai_enkf+Ud_sparse) + K*pressure_observed_i(:,j);
     end
-
-    % Check error
-%     ensemble_pressure_error(i) = norm(mean(pressure_observed_i - pressure_predicted_i,2));
-
 end
 
-toc/60
+% get EnKF RB coefficients
+aalpha_enkf = mhat; % take ensemble mean
+aalpha_rb_p = Z'*ops.X*(UU-Ud); % get projected solution
 
-
-
-aalpha_rb = mhat;%squeeze(mean(aalpha_rb,3));
-% compute solutions
-UU_rb = Z*aalpha_rb + Ud;
+% compute solutions in FE space
+UU_enkf = Z*aalpha_enkf + Ud;
 UU_rb_p = Z*aalpha_rb_p + Ud;
+UU_rb = Z*aalpha_rb + Ud;
 
-test_norm = vecnorm(UU-UU_rb)./vecnorm(UU);
-test_norm_p = vecnorm(UU-UU_rb_p)./vecnorm(UU);
-figure
-plot(1:length(test_norm),test_norm,'o',1:length(test_norm),test_norm_p,'o')
-legend('EnKF results','RB_p results')
+sol_diff = UU-UU_enkf;
+sol_diff_p = UU-UU_rb_p;
+sol_diff_rb = UU-UU_rb;
 
-% compute output
-eqn.out_ke = true;
-ke_rb = compute_output_unsteady(pqt,outfun_rb,outfun_T_rb,tt,aalpha_rb);
-eqn.out_ke = false;
-drag_rb = compute_output_unsteady(pqt,outfun_fe,outfun_T_fe,tt,UU_rb);
-drag_rb_p = compute_output_unsteady(pqt,outfun_fe,outfun_T_fe,tt,UU_rb_p);
+% compute error
+err_mat = zeros(nt,3);
+for tdx = 1:size(UU,2)
+    err_mat(tdx,1) = sqrt(sol_diff(:,tdx)'*ops.X*sol_diff(:,tdx));
+    err_mat(tdx,2) = sqrt(sol_diff_rb(:,tdx)'*ops.X*sol_diff_rb(:,tdx));
+    err_mat(tdx,3) = sqrt(sol_diff_p(:,tdx)'*ops.X*sol_diff_p(:,tdx));
+end
 
-% compute error in KE and drag
-ke_err_rb = abs(ke_rb-ke_fe)/abs(ke_fe);
-ke_err_rb_p = abs(ke_rb_p-ke_rb)/abs(ke_fe);
-ke_err_fe_p = abs(ke_rb_p-ke_fe)/abs(ke_fe);
-drag_err_rb = abs(drag_rb-drag_fe)/abs(drag_fe);
-drag_err_rb_p = abs(drag_rb_p-drag_rb)/abs(drag_fe);
-drag_err_fe_p = abs(drag_rb_p-drag_fe)/abs(drag_fe);
+% normalize error
+fe_norm = sqrt(UU(:,end)'*ops.X*UU(:,end));
+err_mat = err_mat/fe_norm;
+
+% plot error
+xPlot = 0:timeopt.h:(timeopt.h*(nt-1));
+figure;
+plot(xPlot,err_mat(:,1),'o',xPlot,err_mat(:,2),'o',xPlot,err_mat(:,3),'o');
+xlabel("Time"); ylabel("Error");
+legend('EnKF','RB',"RB (projected)",'location','best');
