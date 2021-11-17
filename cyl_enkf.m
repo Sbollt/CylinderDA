@@ -2,7 +2,7 @@
 clear; close all
 
 % Getting the appropriate directories
-%addpath(genpath('../../'));
+addpath(genpath('../../'));
 
 %% Create mesh using distmesh2d (open source)
 
