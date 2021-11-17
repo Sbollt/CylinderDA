@@ -139,7 +139,7 @@ cyl_coord = meshes{3}.coord(cyl_nodes,:);
 % get coordinates for nodes we want to keep
 % compute angle for each node, and organize by angle
 thetaVec = sort(atan2(cyl_coord(:,2),cyl_coord(:,1)));
-n_skip = 2; % number of nodes to skip
+n_skip = 2;
 cyl_coord_sparse = cylR*[cos(thetaVec(1:n_skip:end)),...
     sin(thetaVec(1:n_skip:end-1))]; % compute cylinder coordinates
 
@@ -151,6 +151,7 @@ for idx = 1:length(cyl_coord_sparse)
     cyl_nodes_sparse(idx) = cyl_nodes(thisIndex);
 end
 cyl_nodes_sparse = unique(cyl_nodes_sparse);
+np = length(cyl_nodes_sparse);
 
 % update cyl_coord_sparse
 cyl_coord_sparse = meshes{3}.coord(cyl_nodes_sparse,:);
@@ -165,6 +166,7 @@ axis equal; xlim([-pipeLead,xlimR]);ylim([-pipeR,pipeR]); hold on;
 plot(cyl_coord(:,1),cyl_coord(:,2),'o');
 plot(cyl_coord_sparse(:,1),cyl_coord_sparse(:,2),'gx');
 legend("All nodes","Cylinder nodes","Sparse cylinder nodes");
+drawnow;
 
 %% apply Ensemble Kalman filter to reduced-order model
 % needs to be implemented
@@ -186,19 +188,23 @@ eqn.mu(1) = mmu{1}(1);
 
 % solve RB problem, but apply ENKF
 n_ens = 5;
-aalpha_enkf = zeros(N,nt,n_ens);
-aalpha_enkf(:,1,:) = repmat(aalpha_rb(:,1),[1,1,n_ens]);
+aalpha_enkf_mat = zeros(N,nt,n_ens);
+aalpha_enkf_mat(:,1,:) = repmat(aalpha_rb(:,1),[1,1,n_ens]);
 
 %TODO Intialize N realizations with noise
-Chat = zeros(N, N, nt);
+Chat = zeros(N,N);
 mhat = zeros(N,nt);
-Gamma = 0.001;      % covariance for observations
-IC_perturb = 0.01;
+gammaO = 1e-3; % covariance for observations
+sigmaV = 1e-2; % covariance for state vector
+IC_perturb = 1e-2;
+H = Z_sparse; % linear observor operator
+sScale = 1; % s in equation (10.11), noise or noise in observations
 
 %Add noise to initial conditions
 a0 = aalpha_rb(:,1);
 for jdx = 1:n_ens
-    aalpha_enkf(:,1,jdx) = a0.*(ones(N,1)+randn(N,1)*IC_perturb);
+    thisXi = randn(N,1)*IC_perturb;
+    aalpha_enkf_mat(:,1,jdx) = a0+a0.*thisXi;
 end
 
 %TODO Encapsulate
@@ -211,47 +217,50 @@ for i = 1:nt
     for j = 1:n_ens
         % get solutions for time-marching
         if (i <= timeopt.order)
-            a0 = aalpha_enkf(:,1,j);
+            a0 = aalpha_enkf_mat(:,1,j);
         else
-            a0 = aalpha_enkf(:,i-1:-1:i-timeopt.order,j);
+            a0 = aalpha_enkf_mat(:,i-1:-1:i-timeopt.order,j);
         end
         
         % apply time-marching (update \hat{v}_{j+1})
         [~,ai,~] = bdf(resfun_rb,massfun_rb,a0,timeopt,newtonopt);
-        
-        % get pressure data (predicted by RB model)
-        H = Z_sparse;
-        pressure_predicted_i(:,j) = H*ai(:,end)+Ud_sparse;
-        %         pressure_predicted = Z_sparse*ai(:,end)+Ud_sparse;
         ai_enkf = ai(:,end);
         
-        % Perturbed pressure
-        % get pressure data (observed)
-        %TODO Add perturbations
-        pressure_observed_i(:,j) = UU(cyl_nodes_global,i)...
-            + (randn(length(cyl_nodes_global),1).*UU(cyl_nodes_global,i)*Gamma);
+        % add noise to state vector
+        thisXi = sigmaV*randn(N,1);
+        ai_enkf = ai_enkf + ai_enkf.*thisXi;
+        
+        % apply observor operator (H\hat{v}_{j+1})
+        pressure_predicted_i(:,j) = H*ai_enkf+Ud_sparse;
+        
+        % observe pressure (y_{j+1})
+        thisEta = gammaO*randn(np,1); % noise
+        thisP = UU(cyl_nodes_global,i); % pressure
+        pressure_observed_i(:,j) = thisP + sScale*thisEta;
         
         % save RB solution (prediction)
         % These are \hat{v}_j+1 (for now)
-        aalpha_enkf(:, i, j) = ai_enkf;
+        aalpha_enkf_mat(:,i,j) = ai_enkf;
     end
-    % update solution using ENKF
     %Population mean
-    mhat(:,i) = (1/n_ens)* sum(aalpha_enkf(:,i,:),3);
+    mhat(:,i) = (1/n_ens)* sum(aalpha_enkf_mat(:,i,:),3);
     %Calcuate population covariance
+    Chat = zeros(N,N);
     for j = 1:n_ens
-        Chat(:,:,i) = Chat(:,:,i) + (aalpha_enkf(:,i,j) - mhat(:,i))*(aalpha_enkf(:,i,j) - mhat(:,i))';
+        thisDiff = aalpha_enkf_mat(:,i,j)-mhat(:,i);
+        Chat = Chat + thisDiff*thisDiff';
     end
-    Chat(:,:,i) = (1/(n_ens - 1))*Chat(:,:,i);
+    Chat = Chat/(n_ens-1);
     
     % analysis step
     % Calculate Kalman matricies for update
-    S = H*Chat(:,:,i)*H.';
-    K = Chat(:,:,i)*H.'*pinv(S);
+    S = H*Chat*H'+gammaO*eye(np);
+    K = Chat*H'/S;
     
     %Update time steps (\hat{v}_{j+1} \mapsto v_{j+1}
     for j = 1:n_ens
-        aalpha_enkf(:,i,j) = eye(size(K,1))*ai_enkf - K*(H*ai_enkf+Ud_sparse) + K*pressure_observed_i(:,j);
+        aij_enkf = aalpha_enkf_mat(:,i,j);
+        aalpha_enkf_mat(:,i,j) = aij_enkf - K*(H*aij_enkf+Ud_sparse) + K*pressure_observed_i(:,j);
     end
 end
 
@@ -268,7 +277,7 @@ sol_diff = UU-UU_enkf;
 sol_diff_p = UU-UU_rb_p;
 sol_diff_rb = UU-UU_rb;
 
-% compute error
+% compute error (FE)
 err_mat = zeros(nt,3);
 for tdx = 1:size(UU,2)
     err_mat(tdx,1) = sqrt(sol_diff(:,tdx)'*ops.X*sol_diff(:,tdx));
@@ -276,13 +285,47 @@ for tdx = 1:size(UU,2)
     err_mat(tdx,3) = sqrt(sol_diff_p(:,tdx)'*ops.X*sol_diff_p(:,tdx));
 end
 
-% normalize error
-fe_norm = sqrt(UU(:,end)'*ops.X*UU(:,end));
+% normalize error (FE)
+U_mean = mean(UU,2);
+fe_norm = sqrt(U_mean'*ops.X*U_mean);
 err_mat = err_mat/fe_norm;
 
-% plot error
-xPlot = 0:timeopt.h:(timeopt.h*(nt-1));
+% compute mean solution (for normalization purposes)
+a_mean = mean(aalpha_rb_p,2);
+
+% compute error (RB)
+err_mat_rb = zeros(nt,2);
+for tdx = 1:nt
+    err_mat_rb(tdx,1) = norm(aalpha_enkf(:,tdx)-aalpha_rb_p(:,tdx))/norm(aalpha_rb_p(:,tdx));
+    err_mat_rb(tdx,2) = norm(aalpha_rb(:,tdx)-aalpha_rb_p(:,tdx))/norm(aalpha_rb_p(:,tdx));
+end
+
+% compute RMS
+rms_mat = zeros(nt,1);
+for tdx = 1:nt
+    thisRMS = 0;
+    for qdx = 1:n_ens
+        thisRMS = thisRMS + norm(aalpha_enkf_mat(:,tdx,qdx)-aalpha_enkf(:,tdx))^2/norm(aalpha_enkf(:,tdx))^2;
+    end
+    rms_mat(tdx) = sqrt(thisRMS/(n_ens-1));
+end
+
+% get time-step for plotting
+tPlot = 0:timeopt.h:(timeopt.h*(nt-1));
+
+% plot error (FE)
 figure;
-plot(xPlot,err_mat(:,1),'o',xPlot,err_mat(:,2),'o',xPlot,err_mat(:,3),'o');
+plot(tPlot,err_mat(:,1),'o',tPlot,err_mat(:,2),'o',tPlot,err_mat(:,3),'o');
 xlabel("Time"); ylabel("Error");
 legend('EnKF','RB',"RB (projected)",'location','best');
+
+% plot error (RB)
+figure;
+plot(tPlot,err_mat_rb(:,1),'o',tPlot,err_mat_rb(:,2),'o');
+xlabel("Time"); ylabel("Relative Error (%)");
+legend('EnKF','RB','location','best');
+
+% plot RMS
+figure;
+plot(tPlot,rms_mat,'o');
+xlabel("Time"); ylabel("RMS");
